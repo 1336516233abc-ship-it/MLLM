@@ -52,11 +52,14 @@ class MLLMModel(nn.Module):
             outputs: dict containing各种输出
         """
         # 1. 编码输入
-        vision_features, vision_cls = self.vit_encoder(images)  # (B, num_patches, VIT_DIM)
+        vision_features, vision_cls = self.vit_encoder(images)  # (B, num_patches+1, VIT_DIM)
         text_features, text_pooled = self.text_tokenizer(text_tokens, text_mask)  # (B, seq_len, TEXT_DIM)
 
+        # 去掉 CLS token，只保留 patch 特征传入 LoT 模块
+        vision_patch_features = vision_features[:, 1:, :]  # (B, num_patches, VIT_DIM)
+
         # 2. LoT分层推理
-        lot_outputs = self.lot_module(vision_features, text_features)
+        lot_outputs = self.lot_module(vision_patch_features, text_features)
 
         # 3. 整合模块
         integrated = self.integration_module(lot_outputs)

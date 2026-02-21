@@ -53,16 +53,17 @@ class PreTrainer:
 
         # 3. 边界框回归损失
         if 'bboxes' in targets:
-            bbox_loss = nn.functional.l1_loss(
-                outputs['bboxes'],
-                targets['bboxes']
-            )
+            num_target_boxes = targets['bboxes'].shape[1]  # 100
+            pred_bboxes = outputs['bboxes'][:, :num_target_boxes, :]  # (B, 100, 4)
+            bbox_loss = nn.functional.l1_loss(pred_bboxes, targets['bboxes'])
             losses['bbox_loss'] = bbox_loss
 
         # 4. 关系矩阵损失
         if 'relation_matrix' in targets:
+            num_target_nodes = targets['relation_matrix'].shape[1]  # 100
+            pred_relations = outputs['relation_matrix'][:, :num_target_nodes, :num_target_nodes, :]  # (B, 100, 100, 10)
             relation_loss = nn.functional.cross_entropy(
-                outputs['relation_matrix'].reshape(-1, 10),
+                pred_relations.reshape(-1, 10),
                 targets['relation_matrix'].reshape(-1)
             )
             losses['relation_loss'] = relation_loss
