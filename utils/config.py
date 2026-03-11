@@ -38,13 +38,32 @@ class Config:
     DIFFUSION_CHANNELS = 3
 
     # 训练配置
-    BATCH_SIZE = 8
-    PRETRAIN_EPOCHS = 100
-    PRETRAIN_LR = 1e-4
+    BATCH_SIZE = 32
+    PRETRAIN_EPOCHS = 20
+    PRETRAIN_LR = 1e-3
 
     CGPO_EPOCHS = 50
     CGPO_LR = 5e-5
     CGPO_BETA = 0.1  # KL散度权重
+
+    # DeepSpeed ZeRO-3 配置（改进方向1）
+    USE_DEEPSPEED = False             # 是否启用DeepSpeed
+    DS_CONFIG_PATH = './ds_config.json'  # DeepSpeed配置文件路径
+
+    # Early Stopping 配置（改进方向2）
+    EARLY_STOP_PATIENCE = 5           # 连续多少个验证周期无改善则停止
+    EARLY_STOP_MIN_DELTA = 1e-4       # 最小改善幅度
+
+    # 多任务学习策略配置（改进方向3）
+    MULTITASK_STRATEGY = 'uncertainty'  # 'fixed' | 'uncertainty'
+    # uncertainty: 基于不确定性的自动任务权重平衡（Kendall et al., CVPR 2018）
+
+    # 验证频率（改进方向4）
+    EVAL_EVERY_N_EPOCHS = 1           # 每N个epoch验证一次（原为5）
+
+    # 新loss配置（改进方向5）
+    HIERARCHICAL_CONSISTENCY_WEIGHT = 0.1   # 分层一致性loss权重
+    FEATURE_MATCHING_WEIGHT = 0.05          # 生成任务特征匹配loss权重
 
     # 奖励模型配置
     # 理解部分权重

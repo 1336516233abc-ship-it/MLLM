@@ -90,6 +90,25 @@ class MLLMModel(nn.Module):
             # 关系矩阵
             outputs['relation_matrix'] = lot_outputs['high']['relation_matrix']
 
+        elif mode == 'mixed1':
+            # 理解+生成合并为单次 forward，避免 DDP 多次 forward 引发的梯度同步冲突
+            # 理解输出
+            pooled_features = integrated['features'].mean(dim=1)
+            understanding_logits = self.understanding_head(pooled_features)
+            outputs['understanding_logits'] = understanding_logits
+            outputs['task_logits'] = lot_outputs['low']['task_logits']
+            outputs['semantic_logits'] = lot_outputs['mid']['semantic_logits']
+            outputs['bboxes'] = lot_outputs['mid']['bboxes']
+            outputs['relation_matrix'] = lot_outputs['high']['relation_matrix']
+
+            # 生成输出
+            if target_images is not None:
+                diffusion_loss = self.diffusion_module(
+                    target_images,
+                    integrated['generation_condition']
+                )
+                outputs['diffusion_loss'] = diffusion_loss
+
         elif mode in ['generation', 'editing']:
             # 图像生成/编辑
             if target_images is not None:

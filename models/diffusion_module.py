@@ -108,13 +108,15 @@ class DiffusionUNet(nn.Module):
         )
 
         # 解码器
+        # j=0: 无跳跃连接，输入=channels[-1]
+        # j>0: 拼接编码器特征，输入=上一步输出通道 + 编码器对应层通道
         self.decoder_blocks = nn.ModuleList([
             ResidualBlock(
-                channels[i] * 2 if i < len(channels) - 1 else channels[i],
-                channels[i],
+                channels[-(j+1)] if j == 0 else channels[-j] + channels[-(j+1)],
+                channels[-(j+1)],
                 time_dim,
                 config.DIFFUSION_DIM
-            ) for i in reversed(range(len(channels)))
+            ) for j in range(len(channels))
         ])
 
         self.upsample = nn.ModuleList([
@@ -154,7 +156,7 @@ class DiffusionUNet(nn.Module):
         for i, (block, upsample) in enumerate(zip(self.decoder_blocks, self.upsample)):
             h = upsample(h)
             if i > 0:  # 跳跃连接
-                h = torch.cat([h, encoder_features[-(i)]], dim=1)
+                h = torch.cat([h, encoder_features[-(i+1)]], dim=1)
             h = block(h, time_emb, condition)
 
         # 输出
