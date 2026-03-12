@@ -161,19 +161,6 @@ def pretrain_phase(model, config, train_loader, val_loader, mode='mixed1'):
             import deepspeed
             raw_model = model.module if hasattr(model, 'module') else model
 
-            # 收集需要训练的参数
-            trainable_params = [
-                {'params': raw_model.lot_module.parameters(), 'lr': config.PRETRAIN_LR},
-                {'params': raw_model.integration_module.parameters(), 'lr': config.PRETRAIN_LR},
-                {'params': raw_model.diffusion_module.parameters(), 'lr': config.PRETRAIN_LR},
-                {'params': raw_model.understanding_head.parameters(), 'lr': config.PRETRAIN_LR},
-            ]
-            # 加入多任务平衡器参数
-            if trainer.loss_balancer is not None:
-                trainable_params.append(
-                    {'params': trainer.loss_balancer.parameters(), 'lr': config.PRETRAIN_LR}
-                )
-
             # 加载DeepSpeed配置
             ds_config_path = config.DS_CONFIG_PATH
             with open(ds_config_path, 'r') as f:
@@ -185,16 +172,28 @@ def pretrain_phase(model, config, train_loader, val_loader, mode='mixed1'):
             ds_config['train_batch_size'] = config.BATCH_SIZE * world_size
             ds_config['gradient_accumulation_steps'] = 1
 
+            # 添加optimizer配置到ds_config，让DeepSpeed完整管理optimizer
+            ds_config['optimizer'] = {
+                'type': 'AdamW',
+                'params': {
+                    'lr': config.PRETRAIN_LR,
+                    'betas': [0.9, 0.999],
+                    'eps': 1e-8,
+                    'weight_decay': 0.01
+                }
+            }
+
             ds_engine, ds_optimizer, _, _ = deepspeed.initialize(
                 model=raw_model,
-                model_parameters=trainable_params,
                 config=ds_config
             )
 
             # 用DeepSpeed engine替换model
             model = ds_engine
             trainer.model = ds_engine
-            trainer.set_deepspeed_engine(ds_engine, ds_optimizer)
+            trainer.use_deepspeed = True
+            trainer.ds_engine = ds_engine
+            trainer.optimizer = ds_optimizer
 
             if is_main_process():
                 print("DeepSpeed ZeRO-3 初始化成功!")

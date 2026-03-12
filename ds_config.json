@@ -9,14 +9,17 @@
             "device": "cpu",
             "pin_memory": true
         },
-        "overlap_comm": true,
+        "overlap_comm": false,
         "contiguous_gradients": true,
         "reduce_bucket_size": 50000000,
         "stage3_prefetch_bucket_size": 50000000,
         "stage3_param_persistence_threshold": 100000
     },
     "bf16": {
-        "enabled": true
+        "enabled": false
+    },
+    "fp16": {
+        "enabled": false
     },
     "train_batch_size": "auto",
     "train_micro_batch_size_per_gpu": "auto",

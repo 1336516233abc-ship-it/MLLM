@@ -310,17 +310,14 @@ class PreTrainer:
         self.feature_matching_weight = getattr(config, 'FEATURE_MATCHING_WEIGHT', 0.05)
 
         # 只优化需要训练的模块
-        # DeepSpeed模式下，优化器由DeepSpeed管理，此处不创建
+        # 始终创建optimizer，DeepSpeed初始化成功后会替换
         self.use_deepspeed = getattr(config, 'USE_DEEPSPEED', False)
-        if not self.use_deepspeed:
-            self.optimizer = AdamW([
-                {'params': raw_model.lot_module.parameters(), 'lr': config.PRETRAIN_LR},
-                {'params': raw_model.integration_module.parameters(), 'lr': config.PRETRAIN_LR},
-                {'params': raw_model.diffusion_module.parameters(), 'lr': config.PRETRAIN_LR},
-                {'params': raw_model.understanding_head.parameters(), 'lr': config.PRETRAIN_LR},
-            ] + ([{'params': balancer_params, 'lr': config.PRETRAIN_LR}] if balancer_params else []))
-        else:
-            self.optimizer = None  # DeepSpeed自行管理
+        self.optimizer = AdamW([
+            {'params': raw_model.lot_module.parameters(), 'lr': config.PRETRAIN_LR},
+            {'params': raw_model.integration_module.parameters(), 'lr': config.PRETRAIN_LR},
+            {'params': raw_model.diffusion_module.parameters(), 'lr': config.PRETRAIN_LR},
+            {'params': raw_model.understanding_head.parameters(), 'lr': config.PRETRAIN_LR},
+        ] + ([{'params': balancer_params, 'lr': config.PRETRAIN_LR}] if balancer_params else []))
 
     def set_deepspeed_engine(self, engine, optimizer):
         """DeepSpeed模式下，由外部设置engine和optimizer"""
@@ -571,7 +568,12 @@ class PreTrainer:
         self.model.train()
         if self.loss_balancer is not None:
             self.loss_balancer.train()
-        self.optimizer.zero_grad()
+
+        # DeepSpeed模式下由engine管理zero_grad，标准模式手动调用
+        if self.use_deepspeed:
+            self.ds_engine.zero_grad()
+        else:
+            self.optimizer.zero_grad()
 
         images = batch['images']
         text_tokens = batch['text_tokens']
