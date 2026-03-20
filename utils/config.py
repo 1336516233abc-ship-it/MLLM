@@ -85,9 +85,12 @@ class Config:
     REWARD_UNDERSTANDING_TOTAL = 0.5
     REWARD_GENERATION_TOTAL = 0.5
 
+    # 验证时PSNR/SSIM采样配置（避免每个batch都做1000步DDPM采样）
+    VAL_GENERATION_SAMPLE_BATCHES = 5  # 验证时只对前N个batch采样计算PSNR/SSIM
+
     # 设备配置
     DEVICE = 'cuda'  # 'cuda' or 'cpu'
-    NUM_WORKERS = 4
+    NUM_WORKERS = 2
 
     # 保存路径
     CHECKPOINT_DIR = './checkpoints'

@@ -123,7 +123,7 @@ class MetricsComputer:
     @staticmethod
     def bbox_mean_iou(pred_bboxes, target_bboxes):
         """
-        边界框平均IoU
+        边界框平均IoU（只计算有效框，忽略零填充）
         参考COCO目标检测评估中的IoU计算
         Args:
             pred_bboxes: (B, N, 4) 预测框 [x, y, w, h] 归一化坐标
@@ -131,6 +131,11 @@ class MetricsComputer:
         Returns:
             mean_iou: float
         """
+        # 只计算有效框（target的w和h都>0的位置），忽略零填充
+        valid_mask = (target_bboxes[..., 2] > 0) & (target_bboxes[..., 3] > 0)  # (B, N)
+        if valid_mask.sum() == 0:
+            return 0.0
+
         # 将 (x, y, w, h) 转换为 (x1, y1, x2, y2)
         pred_x1 = pred_bboxes[..., 0] - pred_bboxes[..., 2] / 2
         pred_y1 = pred_bboxes[..., 1] - pred_bboxes[..., 3] / 2
@@ -157,23 +162,43 @@ class MetricsComputer:
         union_area = pred_area + target_area - inter_area
 
         iou = inter_area / (union_area + 1e-6)
-        return iou.mean().item()
+        # 只取有效框的IoU求平均
+        return (iou * valid_mask.float()).sum().item() / valid_mask.sum().item()
 
     @staticmethod
-    def relation_accuracy(pred_logits, target_labels):
+    def relation_accuracy(pred_logits, target_labels, target_bboxes=None):
         """
-        关系分类准确率
+        关系分类准确率（只计算有效目标对之间的关系，忽略零填充区域）
         Args:
             pred_logits: (B, N, N, num_relations) 预测关系logits
             target_labels: (B, N, N) 真实关系标签
+            target_bboxes: (B, N, 4) 真实框，用于判断哪些位置是有效目标
         Returns:
             accuracy: float
         """
-        pred = pred_logits.argmax(dim=-1).reshape(-1)
-        target = target_labels.reshape(-1)
-        correct = (pred == target).float().sum()
-        total = target.numel()
-        return (correct / total).item() if total > 0 else 0.0
+        if target_bboxes is not None:
+            # 只计算有效目标对之间的关系（bbox的w和h都>0）
+            valid_obj = (target_bboxes[..., 2] > 0) & (target_bboxes[..., 3] > 0)  # (B, N)
+            # 构建有效对的mask: (B, N, N)，两个目标都有效才算
+            valid_pair = valid_obj.unsqueeze(2) & valid_obj.unsqueeze(1)  # (B, N, N)
+            # 排除对角线（自身与自身的关系）
+            B, N, _ = valid_pair.shape
+            diag_mask = ~torch.eye(N, dtype=torch.bool, device=valid_pair.device).unsqueeze(0)
+            valid_pair = valid_pair & diag_mask
+
+            if valid_pair.sum() == 0:
+                return 0.0
+
+            pred = pred_logits.argmax(dim=-1)  # (B, N, N)
+            correct = ((pred == target_labels) & valid_pair).float().sum()
+            total = valid_pair.float().sum()
+            return (correct / total).item()
+        else:
+            pred = pred_logits.argmax(dim=-1).reshape(-1)
+            target = target_labels.reshape(-1)
+            correct = (pred == target).float().sum()
+            total = target.numel()
+            return (correct / total).item() if total > 0 else 0.0
 
     @staticmethod
     def psnr(pred_images, target_images, max_val=2.0):
@@ -498,8 +523,8 @@ class PreTrainer:
         理解任务指标（参考COCO benchmark）：
         - task_accuracy: 任务分类准确率
         - semantic_miou: 语义分割mIoU（参考COCO-Stuff评估）
-        - bbox_iou: 边界框平均IoU（参考COCO检测评估）
-        - relation_accuracy: 关系分类准确率
+        - bbox_iou: 边界框平均IoU（参考COCO检测评估，只算有效框）
+        - relation_accuracy: 关系分类准确率（只算有效目标对）
 
         生成任务指标：
         - psnr: 峰值信噪比
@@ -530,24 +555,30 @@ class PreTrainer:
             if 'relation_matrix' in targets and 'relation_matrix' in outputs:
                 num_target_nodes = targets['relation_matrix'].shape[1]
                 pred_relations = outputs['relation_matrix'][:, :num_target_nodes, :num_target_nodes, :]
+                # 传入target_bboxes用于过滤零填充区域
+                target_bboxes = targets.get('bboxes', None)
                 metrics['relation_accuracy'] = self.metrics_computer.relation_accuracy(
-                    pred_relations, targets['relation_matrix']
+                    pred_relations, targets['relation_matrix'], target_bboxes=target_bboxes
                 )
 
-        # 生成任务指标（需要目标图像）
-        if mode in ['generation', 'mixed1', 'mixed'] and 'target_images' in batch:
-            # 使用扩散模型采样生成图像计算指标（仅验证时）
-            if not self.model.training and 'generation_condition' in outputs:
-                raw_model = self.model.module if hasattr(self.model, 'module') else self.model
-                with torch.no_grad():
-                    generated = raw_model.diffusion_module.sample(
-                        outputs['generation_condition'],
-                        image_size=(self.config.IMAGE_SIZE, self.config.IMAGE_SIZE)
-                    )
-                target_images = batch['target_images']
-                metrics['psnr'] = self.metrics_computer.psnr(generated, target_images)
-                metrics['ssim'] = self.metrics_computer.ssim(generated, target_images)
+        return metrics
 
+    def compute_generation_metrics(self, outputs, batch):
+        """
+        单独计算生成任务指标（PSNR, SSIM）
+        需要DDPM采样，开销大，只对少量batch调用
+        """
+        metrics = {}
+        if 'target_images' in batch and 'generation_condition' in outputs:
+            raw_model = self.model.module if hasattr(self.model, 'module') else self.model
+            with torch.no_grad():
+                generated = raw_model.diffusion_module.sample(
+                    outputs['generation_condition'],
+                    image_size=(self.config.IMAGE_SIZE, self.config.IMAGE_SIZE)
+                )
+            target_images = batch['target_images']
+            metrics['psnr'] = self.metrics_computer.psnr(generated, target_images)
+            metrics['ssim'] = self.metrics_computer.ssim(generated, target_images)
         return metrics
 
     def train_step(self, batch, mode='mixed'):
@@ -774,17 +805,27 @@ class PreTrainer:
 
     def validate(self, dataloader, mode='mixed'):
         """
-        验证模型（改进方向4: 增加评估指标）
+        验证模型（修复版）
 
-        除了计算loss外，还计算以下指标：
-        - 理解任务: task_accuracy, semantic_miou, bbox_iou, relation_accuracy
-        - 生成任务: psnr, ssim
+        修复内容：
+        1. mixed1模式使用单次forward代替两次forward，提速
+        2. 添加新loss（hierarchical_consistency_loss, feature_matching_loss）到验证输出
+        3. PSNR/SSIM只对前N个batch采样计算，避免每个batch都做1000步DDPM
+        4. 指标只计算有效位置（忽略零填充），使值更合理
+
+        指标：
+        - Loss: task_loss, semantic_loss, bbox_loss, relation_loss, diffusion_loss,
+                hierarchical_consistency_loss, feature_matching_loss
+        - 理解: task_accuracy, semantic_miou, bbox_iou, relation_accuracy
+        - 生成: psnr, ssim
         """
         self.model.eval()
         if self.loss_balancer is not None:
             self.loss_balancer.eval()
 
         total_metrics = {}
+        gen_sample_count = 0
+        max_gen_samples = getattr(self.config, 'VAL_GENERATION_SAMPLE_BATCHES', 5)
 
         with torch.no_grad():
             for batch in tqdm(dataloader, desc="Validation"):
@@ -804,81 +845,133 @@ class PreTrainer:
                 images = batch_device['images']
                 text_tokens = batch_device['text_tokens']
                 text_mask = batch_device['text_mask']
+                target_images = batch_device.get('target_images')
 
-                # 理解任务验证
-                if mode in ['understanding', 'mixed1', 'mixed2', 'mixed']:
-                    understanding_outputs = self.model(
+                if mode == 'mixed1':
+                    # 单次mixed1 forward，同时得到理解和生成输出
+                    outputs = self.model(
                         images, text_tokens, text_mask,
-                        mode='understanding'
+                        target_images=target_images,
+                        mode='mixed1'
                     )
 
+                    # === Loss指标 ===
+                    # 理解任务loss
                     if 'targets' in batch_device:
                         understanding_losses = self.compute_understanding_losses(
-                            understanding_outputs,
-                            batch_device['targets']
+                            outputs, batch_device['targets']
                         )
-
                         for loss_name, loss_value in understanding_losses.items():
                             if loss_name not in total_metrics:
                                 total_metrics[loss_name] = []
                             total_metrics[loss_name].append(loss_value.item())
 
-                    # 改进方向4: 计算理解任务评估指标
-                    eval_metrics = self.compute_eval_metrics(
-                        understanding_outputs, batch_device, mode=mode
-                    )
+                    # 生成任务loss（diffusion_loss）
+                    if 'diffusion_loss' in outputs:
+                        if 'diffusion_loss' not in total_metrics:
+                            total_metrics['diffusion_loss'] = []
+                        total_metrics['diffusion_loss'].append(outputs['diffusion_loss'].item())
+
+                    # 新loss: 分层一致性损失
+                    if 'lot_outputs' in outputs:
+                        hier_loss = self.compute_hierarchical_consistency_loss(outputs['lot_outputs'])
+                        if 'hierarchical_consistency_loss' not in total_metrics:
+                            total_metrics['hierarchical_consistency_loss'] = []
+                        total_metrics['hierarchical_consistency_loss'].append(hier_loss.item())
+
+                    # 新loss: 特征匹配损失
+                    if target_images is not None and 'generation_condition' in outputs:
+                        fm_loss = self.compute_feature_matching_loss(outputs, target_images)
+                        if 'feature_matching_loss' not in total_metrics:
+                            total_metrics['feature_matching_loss'] = []
+                        total_metrics['feature_matching_loss'].append(fm_loss.item())
+
+                    # === 评估指标 ===
+                    # 理解任务指标（每个batch都算，开销小）
+                    eval_metrics = self.compute_eval_metrics(outputs, batch_device, mode=mode)
                     for metric_name, metric_value in eval_metrics.items():
                         if metric_name not in total_metrics:
                             total_metrics[metric_name] = []
                         total_metrics[metric_name].append(metric_value)
 
-                # 生成任务验证
-                if mode in ['generation', 'mixed1', 'mixed'] and 'target_images' in batch_device:
-                    target_images = batch_device['target_images']
+                    # 生成任务指标（PSNR/SSIM，只对前N个batch采样，开销大）
+                    if gen_sample_count < max_gen_samples and 'generation_condition' in outputs:
+                        gen_metrics = self.compute_generation_metrics(outputs, batch_device)
+                        for metric_name, metric_value in gen_metrics.items():
+                            if metric_name not in total_metrics:
+                                total_metrics[metric_name] = []
+                            total_metrics[metric_name].append(metric_value)
+                        gen_sample_count += 1
 
-                    generation_outputs = self.model(
-                        images, text_tokens, text_mask,
-                        target_images=target_images,
-                        mode='generation'
-                    )
+                else:
+                    # 非mixed1模式：保持原有逻辑
+                    # 理解任务验证
+                    if mode in ['understanding', 'mixed2', 'mixed']:
+                        understanding_outputs = self.model(
+                            images, text_tokens, text_mask,
+                            mode='understanding'
+                        )
 
-                    diffusion_loss = generation_outputs['diffusion_loss']
+                        if 'targets' in batch_device:
+                            understanding_losses = self.compute_understanding_losses(
+                                understanding_outputs, batch_device['targets']
+                            )
+                            for loss_name, loss_value in understanding_losses.items():
+                                if loss_name not in total_metrics:
+                                    total_metrics[loss_name] = []
+                                total_metrics[loss_name].append(loss_value.item())
 
-                    if 'diffusion_loss' not in total_metrics:
-                        total_metrics['diffusion_loss'] = []
-                    total_metrics['diffusion_loss'].append(diffusion_loss.item())
+                        eval_metrics = self.compute_eval_metrics(
+                            understanding_outputs, batch_device, mode=mode
+                        )
+                        for metric_name, metric_value in eval_metrics.items():
+                            if metric_name not in total_metrics:
+                                total_metrics[metric_name] = []
+                            total_metrics[metric_name].append(metric_value)
 
-                    # 改进方向4: 计算生成任务评估指标（PSNR, SSIM）
-                    gen_metrics = self.compute_eval_metrics(
-                        generation_outputs, batch_device, mode=mode
-                    )
-                    for metric_name, metric_value in gen_metrics.items():
-                        if metric_name not in total_metrics:
-                            total_metrics[metric_name] = []
-                        total_metrics[metric_name].append(metric_value)
+                    # 生成任务验证
+                    if mode in ['generation', 'mixed'] and 'target_images' in batch_device:
+                        generation_outputs = self.model(
+                            images, text_tokens, text_mask,
+                            target_images=target_images,
+                            mode='generation'
+                        )
 
-                # 编辑任务验证
-                if mode in ['editing', 'mixed2', 'mixed'] and 'edited_images' in batch_device:
-                    source_images = batch_device['images']
-                    edited_images = batch_device['edited_images']
+                        if 'diffusion_loss' in generation_outputs:
+                            if 'diffusion_loss' not in total_metrics:
+                                total_metrics['diffusion_loss'] = []
+                            total_metrics['diffusion_loss'].append(generation_outputs['diffusion_loss'].item())
 
-                    editing_outputs = self.model(
-                        source_images, text_tokens, text_mask,
-                        target_images=edited_images,
-                        mode='editing'
-                    )
+                        if gen_sample_count < max_gen_samples and 'generation_condition' in generation_outputs:
+                            gen_metrics = self.compute_generation_metrics(generation_outputs, batch_device)
+                            for metric_name, metric_value in gen_metrics.items():
+                                if metric_name not in total_metrics:
+                                    total_metrics[metric_name] = []
+                                total_metrics[metric_name].append(metric_value)
+                            gen_sample_count += 1
 
-                    editing_losses = self.compute_editing_losses(
-                        editing_outputs,
-                        batch_device.get('targets', {}),
-                        source_images,
-                        edited_images
-                    )
+                    # 编辑任务验证
+                    if mode in ['editing', 'mixed2', 'mixed'] and 'edited_images' in batch_device:
+                        source_images = batch_device['images']
+                        edited_images = batch_device['edited_images']
 
-                    for loss_name, loss_value in editing_losses.items():
-                        if loss_name not in total_metrics:
-                            total_metrics[loss_name] = []
-                        total_metrics[loss_name].append(loss_value.item())
+                        editing_outputs = self.model(
+                            source_images, text_tokens, text_mask,
+                            target_images=edited_images,
+                            mode='editing'
+                        )
+
+                        editing_losses = self.compute_editing_losses(
+                            editing_outputs,
+                            batch_device.get('targets', {}),
+                            source_images,
+                            edited_images
+                        )
+
+                        for loss_name, loss_value in editing_losses.items():
+                            if loss_name not in total_metrics:
+                                total_metrics[loss_name] = []
+                            total_metrics[loss_name].append(loss_value.item())
 
         # 计算平均指标
         avg_metrics = {key: sum(values) / len(values)

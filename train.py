@@ -183,10 +183,23 @@ def pretrain_phase(model, config, train_loader, val_loader, mode='mixed1'):
                 }
             }
 
-            ds_engine, ds_optimizer, _, _ = deepspeed.initialize(
-                model=raw_model,
-                config=ds_config
-            )
+            try:
+                ds_engine, ds_optimizer, _, _ = deepspeed.initialize(
+                    model=raw_model,
+                    config=ds_config
+                )
+            except AttributeError as e:
+                # overlap_comm在某些DeepSpeed版本中不兼容，自动回退
+                if 'overlapping_partition_gradients_reduce_epilogue' in str(e):
+                    if is_main_process():
+                        print("警告: overlap_comm不兼容当前DeepSpeed版本，自动关闭")
+                    ds_config['zero_optimization']['overlap_comm'] = False
+                    ds_engine, ds_optimizer, _, _ = deepspeed.initialize(
+                        model=raw_model,
+                        config=ds_config
+                    )
+                else:
+                    raise
 
             # 用DeepSpeed engine替换model
             model = ds_engine
@@ -249,31 +262,37 @@ def pretrain_phase(model, config, train_loader, val_loader, mode='mixed1'):
         if epoch % eval_every == 0:
             val_metrics = trainer.validate(val_loader, mode=mode)
             if is_main_process():
-                # 输出验证loss
+                # 输出验证loss（包括新增的loss）
                 print(f"\nEpoch {epoch} 验证结果:")
                 print(f"  Loss指标:")
-                for k, v in val_metrics.items():
-                    if 'loss' in k:
-                        print(f"    - {k}: {v:.4f}")
+                print(f"    - task_loss:     {val_metrics.get('task_loss', 0):.4f}")
+                print(f"    - semantic_loss: {val_metrics.get('semantic_loss', 0):.4f}")
+                print(f"    - bbox_loss:     {val_metrics.get('bbox_loss', 0):.4f}")
+                print(f"    - relation_loss: {val_metrics.get('relation_loss', 0):.4f}")
+                print(f"    - diffusion_loss:{val_metrics.get('diffusion_loss', 0):.4f}")
+                if 'hierarchical_consistency_loss' in val_metrics:
+                    print(f"    - hierarchical_consistency_loss: "
+                          f"{val_metrics['hierarchical_consistency_loss']:.4f}")
+                if 'feature_matching_loss' in val_metrics:
+                    print(f"    - feature_matching_loss: "
+                          f"{val_metrics['feature_matching_loss']:.4f}")
 
-                # 改进方向4: 输出评估指标
-                eval_keys = ['task_accuracy', 'semantic_miou', 'bbox_iou',
-                             'relation_accuracy', 'psnr', 'ssim']
-                has_eval = any(k in val_metrics for k in eval_keys)
-                if has_eval:
-                    print(f"  评估指标:")
-                    if 'task_accuracy' in val_metrics:
-                        print(f"    - 任务分类准确率: {val_metrics['task_accuracy']:.4f}")
-                    if 'semantic_miou' in val_metrics:
-                        print(f"    - 语义分割mIoU:  {val_metrics['semantic_miou']:.4f}")
-                    if 'bbox_iou' in val_metrics:
-                        print(f"    - 边界框平均IoU:  {val_metrics['bbox_iou']:.4f}")
-                    if 'relation_accuracy' in val_metrics:
-                        print(f"    - 关系分类准确率: {val_metrics['relation_accuracy']:.4f}")
-                    if 'psnr' in val_metrics:
-                        print(f"    - PSNR(dB):      {val_metrics['psnr']:.2f}")
-                    if 'ssim' in val_metrics:
-                        print(f"    - SSIM:          {val_metrics['ssim']:.4f}")
+                # 输出评估指标
+                print(f"  评估指标:")
+                print(f"    理解任务:")
+                print(f"      - 任务分类准确率: {val_metrics.get('task_accuracy', 0):.4f}")
+                print(f"      - 语义分割mIoU:  {val_metrics.get('semantic_miou', 0):.4f}")
+                print(f"      - 边界框平均IoU:  {val_metrics.get('bbox_iou', 0):.4f}")
+                print(f"      - 关系分类准确率: {val_metrics.get('relation_accuracy', 0):.4f}")
+                print(f"    生成任务:")
+                if 'psnr' in val_metrics:
+                    print(f"      - PSNR(dB):      {val_metrics['psnr']:.2f}")
+                else:
+                    print(f"      - PSNR(dB):      未计算")
+                if 'ssim' in val_metrics:
+                    print(f"      - SSIM:          {val_metrics['ssim']:.4f}")
+                else:
+                    print(f"      - SSIM:          未计算")
 
                 # 计算验证总loss用于模型保存和early stopping
                 val_loss_keys = [k for k in val_metrics if 'loss' in k]
